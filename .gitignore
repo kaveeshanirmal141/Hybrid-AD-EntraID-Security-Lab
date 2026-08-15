@@ -1,0 +1,60 @@
+# This repo is public. Nothing in these categories should ever be committed,
+# even temporarily. If a file matches one of these patterns and genuinely
+# needs to be referenced, put a sanitized/redacted copy in docs/ instead.
+
+# Credentials and secrets
+*.env
+secrets.env
+credentials.txt
+config.local.*
+
+# Certificates and keys
+*.pfx
+*.cer
+*.crt
+*.key
+*.pem
+
+# Kerberos tickets and hash dumps
+*.kirbi
+*.ccache
+hashes.txt
+ntds.dit
+SAM
+SYSTEM
+SECURITY
+*.ntds
+
+# Loot / captured attack output
+loot/
+dumps/
+*.log
+
+# Terraform / IaC state (can contain resource IDs, secrets, tokens)
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+
+# Vagrant
+.vagrant/
+
+# VM disk images, snapshots, install media (large and sensitive, never commit)
+*.vmdk
+*.vdi
+*.vhd
+*.vhdx
+*.ova
+*.ovf
+*.iso
+*.snapshot
+*.nvram
+
+# Ansible
+*.retry
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
