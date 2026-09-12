@@ -1,0 +1,52 @@
+// ============================================================
+// Kerberoasting Detection Rule
+// MITRE ATT&CK: T1558.003
+// Phase 03 — Attack #1
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// Multiple Kerberos service ticket requests (Event 4769) from
+// the same non-machine user account, targeting non-machine
+// service accounts, within a 5-minute window.
+//
+// Covers both AES256 (0x12) and RC4 (0x17) encryption types.
+// RC4 on a WS2025 domain indicates a forced downgrade attack
+// (attacker explicitly requesting RC4 for faster offline cracking)
+// and should be treated as a higher-priority signal.
+//
+// Expected alert for this lab's attack:
+//   AccountName   : john.smith
+//   SourceIP      : 192.168.112.xxx (ATTACKER01)
+//   RequestCount  : 4
+//   TargetAccounts: ["svc.http", "svc.sql"]
+// ============================================================
+
+SecurityEvent
+| where EventID == 4769
+| where AccountName !endswith "$"                        // exclude machine account requestors
+| where ServiceName !endswith "$"                        // exclude machine account targets
+| where ServiceName !startswith "krbtgt"                 // exclude normal TGT-related traffic
+| where TicketEncryptionType in ("0x12", "0x17")        // AES256 or RC4
+| summarize
+    RequestCount    = count(),
+    TargetAccounts  = make_set(ServiceName),
+    SourceIP        = any(IpAddress)
+    by AccountName, bin(TimeGenerated, 5m)
+| where RequestCount >= 2                                // multiple SPNs in 5-min window
+| extend AttackSignal = strcat(
+    AccountName, " requested ", RequestCount,
+    " service tickets from ", SourceIP,
+    " targeting: ", tostring(TargetAccounts))
+| extend Severity = iff(
+    TargetAccounts has "0x17", "High",                  // RC4 downgrade = higher severity
+    "Medium")
+| project
+    TimeGenerated,
+    AccountName,
+    SourceIP,
+    RequestCount,
+    TargetAccounts,
+    Severity,
+    AttackSignal
+| sort by TimeGenerated desc
