@@ -1,0 +1,49 @@
+// ============================================================
+// AS-REP Roasting Detection Rule
+// MITRE ATT&CK: T1558.004
+// Phase 03 — Attack #2
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// A single Event 4768 with Pre-Authentication Type = 0
+// from a non-machine account is sufficient to alert.
+// Unlike Kerberoasting, no correlation window is needed —
+// Pre-Auth Type 0 on a non-machine account is always suspicious.
+//
+// RC4 encryption type on a WS2025 domain that enforces AES
+// indicates a deliberate downgrade — treated as higher severity.
+//
+// Expected alert for this lab's attack:
+//   TargetAccount : svc.backup
+//   SourceIP      : 192.168.112.xxx (ATTACKER01)
+//   EncryptionType: 0x17 (RC4 — downgrade from AES domain default)
+//   Severity      : High
+// ============================================================
+
+SecurityEvent
+| where EventID == 4768
+| where EventData has "Pre-Authentication Type:\t0"  // the attack signature field
+| where AccountName !endswith "$"                     // exclude machine accounts
+| extend
+    TargetAccount  = AccountName,
+    SourceIP       = IpAddress,
+    EncryptionType = extract(@"Ticket Encryption Type:\t(\S+)", 1, EventData),
+    ResultCode     = extract(@"Result Code:\t(\S+)", 1, EventData)
+| where ResultCode == "0x0"                           // only successful AS-REP issuances
+| extend Severity = case(
+    EncryptionType == "0x17", "High",                 // RC4 on AES-enforcing domain = deliberate downgrade
+    EncryptionType == "0x12", "Medium",               // AES256 — less common but still suspicious
+    "Medium")
+| extend AttackSignal = strcat(
+    "AS-REP issued for ", TargetAccount,
+    " from ", SourceIP,
+    " with no pre-authentication (etype: ", EncryptionType, ")")
+| project
+    TimeGenerated,
+    TargetAccount,
+    SourceIP,
+    EncryptionType,
+    Severity,
+    AttackSignal
+| sort by TimeGenerated desc
