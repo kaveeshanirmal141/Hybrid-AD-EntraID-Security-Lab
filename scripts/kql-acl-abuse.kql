@@ -1,0 +1,66 @@
+// ============================================================
+// ACL/DACL Abuse — Targeted Kerberoasting Detection
+// MITRE ATT&CK: T1222.001 + T1558.003
+// Phase 03 — Attack #3
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// Event 4769 where ServiceName is a regular user account.
+// In normal Kerberos traffic, service ticket requests target
+// service accounts or machine accounts — never a user account.
+// A user account as a ServiceName = fake SPN was set on it
+// by an attacker abusing a write permission (GenericWrite etc).
+//
+// Expected alert for this lab's attack:
+//   AccountName   : john.smith (attacker)
+//   ServiceName   : sarah.jones (victim — user account)
+//   IpAddress     : 192.168.112.138 (ATTACKER01)
+//
+// Note: Event 5136 (SPN write via attribute modification) is the
+// upstream signal but requires per-attribute SACL auditing on
+// user objects — not configured by default. See hardening notes.
+// ============================================================
+
+// -- Primary detection: 4769 with user account as service target --
+
+let KnownServiceAccounts = dynamic(["svc.http", "svc.sql", "svc.backup", "krbtgt"]);
+
+SecurityEvent
+| where EventID == 4769
+| where AccountName !endswith "$"                          // exclude machine account requestors
+| where ServiceName !endswith "$"                          // exclude machine account targets
+| where ServiceName !startswith "krbtgt"                   // exclude normal TGT traffic
+| where ServiceName !in (KnownServiceAccounts)             // exclude known legitimate service accounts
+| where TicketEncryptionType in ("0x12", "0x17")          // AES256 or RC4
+| extend
+    Attacker      = AccountName,
+    VictimAccount = ServiceName,
+    SourceIP      = IpAddress,
+    EncType       = TicketEncryptionType
+| extend AttackSignal = strcat(
+    Attacker, " requested service ticket for user account ",
+    VictimAccount, " from ", SourceIP,
+    " (etype: ", EncType, ") — possible ACL abuse / targeted Kerberoasting")
+| project
+    TimeGenerated,
+    Attacker,
+    VictimAccount,
+    SourceIP,
+    EncType,
+    AttackSignal
+| sort by TimeGenerated desc
+
+// -- Supplementary: 5136 SPN attribute write (requires SACL config) --
+// Uncomment when per-attribute SACL auditing is configured on user objects
+
+// SecurityEvent
+// | where EventID == 5136
+// | where EventData has "servicePrincipalName"
+// | where EventData has "%%14674"              // value added operation
+// | extend
+//     ModifiedBy     = extract(@"Subject:\s+Account Name:\s+(\S+)", 1, EventData),
+//     ModifiedObject = extract(@"Object:\s+Object Name:\s+(\S+)", 1, EventData),
+//     NewSPN         = extract(@"New Value:\s+(.+)", 1, EventData)
+// | project TimeGenerated, ModifiedBy, ModifiedObject, NewSPN
+// | sort by TimeGenerated desc
