@@ -1,0 +1,57 @@
+// ============================================================
+// DCSync Detection Rule
+// MITRE ATT&CK: T1003.006
+// Phase 03 — Attack #4
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// A cluster of Event 4662 entries from a non-DC source account
+// accessing DS-Replication-Get-Changes-All on the domain object
+// within a short time window.
+//
+// DC-to-DC replication is normal and expected.
+// A workstation or member server requesting replication is not.
+//
+// Expected alert for this lab's attack:
+//   SubjectUserName : adm.kavee (Domain Admin)
+//   SourceIP        : 192.168.112.138 (ATTACKER01 — not a DC)
+//   ReplicationCount: 12+ (one per account replicated)
+//
+// GUIDs referenced:
+//   1131f6aa-9c07-11d1-f79f-00c04fc2dcd2 = DS-Replication-Get-Changes
+//   1131f6ad-9c07-11d1-f79f-00c04fc2dcd2 = DS-Replication-Get-Changes-All
+//   89e95b76-444d-4c62-991a-0facbeda640c = DS-Replication-Get-Changes-In-Filtered-Set
+// ============================================================
+
+let DomainControllers = dynamic(["DC01", "DC01$"]);
+
+SecurityEvent
+| where EventID == 4662
+| where ObjectType == "domainDNS"
+| where EventData has "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"   // DS-Replication-Get-Changes-All
+     or EventData has "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"   // DS-Replication-Get-Changes
+| where SubjectUserName !in (DomainControllers)                  // exclude legitimate DC replication
+| where SubjectUserName !endswith "$"                            // exclude machine accounts
+| summarize
+    ReplicationCount = count(),
+    SourceIP         = any(IpAddress),
+    FirstSeen        = min(TimeGenerated),
+    LastSeen         = max(TimeGenerated)
+    by SubjectUserName, bin(TimeGenerated, 1m)
+| where ReplicationCount >= 3                                    // cluster = DCSync, single = noise
+| extend
+    DurationSeconds = datetime_diff('second', LastSeen, FirstSeen),
+    AttackSignal = strcat(
+        SubjectUserName, " performed ", ReplicationCount,
+        " replication operations from ", SourceIP,
+        " over ", tostring(datetime_diff('second', LastSeen, FirstSeen)), " seconds",
+        " (non-DC source — DCSync likely)")
+| project
+    TimeGenerated,
+    SubjectUserName,
+    SourceIP,
+    ReplicationCount,
+    DurationSeconds,
+    AttackSignal
+| sort by TimeGenerated desc
