@@ -1,0 +1,101 @@
+// ============================================================
+// Golden Ticket + Pass-the-Hash Detection Rule
+// MITRE ATT&CK: T1558.001 + T1550.002
+// Phase 03 — Attack #5
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Two detection surfaces:
+//
+// 1. Pass-the-Hash via NTLM:
+//    Logon Type 3 (network) for privileged accounts from
+//    non-DC, non-management IPs. Administrator or DA accounts
+//    should not network-logon to DCs from workstation IPs.
+//
+// 2. WMI-based command execution on DC:
+//    cmd.exe or powershell.exe spawned under WmiPrvSE.exe
+//    on a domain controller — impacket wmiexec signature.
+//
+// Golden Ticket detection (when/if Kerberos validation fails):
+//    4768 with anomalous ticket lifetime or group mismatches
+//    (requires PAC inspection beyond standard event logging)
+//
+// Expected alert for this lab's attack:
+//   AccountName  : administrator
+//   LogonType    : 3 (network)
+//   SourceIP     : 192.168.112.138 (ATTACKER01 — not a DC)
+//   Computer     : DC01
+// ============================================================
+
+let DomainControllers = dynamic(["DC01", "DC01.kaveelab.internal"]);
+let PrivilegedAccounts = dynamic(["administrator", "adm.kavee"]);
+let ManagementSubnets = dynamic(["192.168.112.10"]);   // add jump server IPs here
+
+// -- Detection 1: Pass-the-Hash (NTLM network logon to DC) --
+
+SecurityEvent
+| where EventID == 4624
+| where LogonType == 3                                       // network logon
+| where AccountName in~ (PrivilegedAccounts)                 // privileged account
+| where Computer in~ (DomainControllers)                     // target is a DC
+| where AuthenticationPackageName == "NTLM"                  // NTLM not Kerberos
+| where IpAddress !in (ManagementSubnets)                    // not from known management IP
+| where IpAddress != "-" and IpAddress != "::1"             // exclude local
+| extend AttackSignal = strcat(
+    AccountName, " performed NTLM network logon to ",
+    Computer, " from ", IpAddress,
+    " — possible Pass-the-Hash")
+| project
+    TimeGenerated,
+    AccountName,
+    Computer,
+    IpAddress,
+    LogonType,
+    AuthenticationPackageName,
+    AttackSignal
+| sort by TimeGenerated desc
+
+// ============================================================
+
+// -- Detection 2: WMI-based command execution on DC --
+// (impacket wmiexec signature — cmd.exe under WmiPrvSE.exe)
+
+// Using Sysmon Event 1 (Process Create)
+// Requires Sysmon installed with SwiftOnSecurity config
+
+SecurityEvent
+| where EventID == 4688                                      // process creation
+| where Computer in~ (DomainControllers)
+| where ParentProcessName has "WmiPrvSE.exe"                 // WMI provider spawning
+| where NewProcessName has_any ("cmd.exe", "powershell.exe", "whoami.exe")
+| extend AttackSignal = strcat(
+    "Suspicious process ", NewProcessName,
+    " spawned by WmiPrvSE.exe on ", Computer,
+    " — possible WMI-based remote execution (impacket wmiexec)")
+| project
+    TimeGenerated,
+    Computer,
+    SubjectUserName,
+    ParentProcessName,
+    NewProcessName,
+    AttackSignal
+| sort by TimeGenerated desc
+
+// ============================================================
+
+// -- Detection 3: Golden Ticket anomaly (PAC lifetime check) --
+// Forged tickets often have anomalous lifetimes (impacket default: 10 years)
+
+SecurityEvent
+| where EventID == 4769                                      // service ticket request
+| where TicketOptions has "0x40810010"                       // forwardable + renewable flags
+| extend TicketLifetimeHours = datetime_diff(
+    'hour',
+    todatetime(extract(@"Ticket Expiration Time:\s+(.+)", 1, EventData)),
+    TimeGenerated)
+| where TicketLifetimeHours > 24                            // normal max is 10 hours
+| extend AttackSignal = strcat(
+    AccountName, " presented a ticket with anomalous lifetime: ",
+    tostring(TicketLifetimeHours), " hours — possible Golden Ticket")
+| project TimeGenerated, AccountName, ServiceName, IpAddress, TicketLifetimeHours, AttackSignal
+| sort by TimeGenerated desc
