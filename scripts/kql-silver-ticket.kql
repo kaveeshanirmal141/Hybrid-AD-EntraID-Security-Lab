@@ -1,0 +1,91 @@
+// ============================================================
+// Silver Ticket Detection Rule
+// MITRE ATT&CK: T1558.002
+// Phase 03 — Attack #6
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// Silver Ticket produces a 4624 Kerberos logon on the target
+// machine with NO corresponding 4769 service ticket request
+// from the same source IP in the preceding window.
+//
+// Legitimate Kerberos service auth flow:
+//   1. Client contacts KDC → 4769 fires (service ticket issued)
+//   2. Client uses ticket → 4624 fires (logon on target)
+//
+// Silver Ticket flow:
+//   1. Ticket forged offline → NO 4769 (KDC never asked)
+//   2. Client uses ticket → 4624 fires (logon on target)
+//
+// The absence of 4769 before a 4624 is the detection signal.
+//
+// Secondary signal: SubjectUserName = "-" on a 4624 event.
+// Legitimate sessions always have a subject. Silver Ticket
+// logons have no subject because there is no prior TGT context.
+//
+// Expected alert for this lab's attack:
+//   TargetUserName : administrator
+//   LogonType      : 3 (network)
+//   SubjectUserName: -
+//   Computer       : DC01
+//   Source IP      : 192.168.112.138 (ATTACKER01)
+// ============================================================
+
+let LookbackWindow = 5m;
+let DomainControllers = dynamic(["DC01", "DC01.kaveelab.internal"]);
+
+// -- Primary detection: 4624 with no preceding 4769 (Silver Ticket) --
+
+let ServiceTicketRequests =
+    SecurityEvent
+    | where EventID == 4769
+    | where TimeGenerated > ago(24h)
+    | project TicketTime = TimeGenerated, TicketSourceIP = IpAddress, TicketUser = AccountName;
+
+SecurityEvent
+| where EventID == 4624
+| where LogonType == 3                                          // network logon
+| where AuthenticationPackageName == "Kerberos"                // Kerberos-based
+| where Computer in~ (DomainControllers)                       // targeting a DC
+| where SubjectUserName == "-" or SubjectUserName == ""        // no local subject
+| where TargetUserName !endswith "$"                           // not machine accounts
+| join kind=leftanti (
+    ServiceTicketRequests
+    | where TicketTime between (ago(24h) .. now())
+) on $left.IpAddress == $right.TicketSourceIP                  // no matching 4769 from same IP
+| extend AttackSignal = strcat(
+    "Kerberos logon by ", TargetUserName,
+    " on ", Computer,
+    " from ", IpAddress,
+    " with no preceding 4769 service ticket request",
+    " — possible Silver Ticket (SubjectUserName: ", SubjectUserName, ")")
+| project
+    TimeGenerated,
+    Computer,
+    TargetUserName,
+    TargetUserSid,
+    IpAddress,
+    LogonType,
+    SubjectUserName,
+    AttackSignal
+| sort by TimeGenerated desc
+
+// ============================================================
+
+// -- Secondary detection: SubjectUserName absent on DC Kerberos logon --
+// Simpler rule, higher false-positive rate, useful as supplementary alert
+
+SecurityEvent
+| where EventID == 4624
+| where LogonType == 3
+| where AuthenticationPackageName == "Kerberos"
+| where Computer in~ (DomainControllers)
+| where SubjectUserName in ("-", "")
+| where TargetUserName in~ ("administrator", "adm.kavee")     // privileged accounts only
+| extend AttackSignal = strcat(
+    "Privileged Kerberos logon without subject context: ",
+    TargetUserName, " on ", Computer, " from ", IpAddress,
+    " — investigate for Silver Ticket")
+| project TimeGenerated, Computer, TargetUserName, IpAddress, AttackSignal
+| sort by TimeGenerated desc
