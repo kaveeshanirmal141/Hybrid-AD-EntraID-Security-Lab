@@ -1,0 +1,89 @@
+// ============================================================
+// AD CS ESC1 Detection Rule
+// MITRE ATT&CK: T1649
+// Phase 03 — Attack #7
+// Tests in Microsoft Sentinel, Phase 07
+// ============================================================
+//
+// Detection logic:
+// ESC1 produces a certificate where the requester's identity
+// (who asked) differs from the certificate subject (who it
+// claims to be). Event 4887 on the CA server records both.
+//
+// A mismatch where a low-privilege account requests a cert
+// naming a privileged account is the ESC1 signal.
+//
+// Also alert on any certificate issued with a privileged
+// account UPN (administrator, domain admin) regardless of
+// who requested it — the issuance itself is suspicious.
+//
+// Expected alert for this lab's attack:
+//   Requester    : john.smith (KAVEELAB\john.smith)
+//   CertSubject  : administrator@kaveelab.internal
+//   Template     : KaveeLab-ESC1
+//   CA           : KaveeLab-CA
+//   Source       : MEMSRV01
+// ============================================================
+
+let PrivilegedAccounts = dynamic([
+    "administrator", "adm.kavee", "krbtgt"
+]);
+
+let PrivilegedGroups = dynamic([
+    "Domain Admins", "Enterprise Admins", "Schema Admins"
+]);
+
+// -- Primary detection: Certificate issued with privileged subject --
+// Event 4887: Certificate Services approved and issued a certificate
+
+SecurityEvent
+| where EventID == 4887                                        // cert issued
+| where Computer has "MEMSRV01"                               // from the CA server
+| extend
+    Requester    = extract(@"Requester:\s+(.+?)[\r\n]", 1, EventData),
+    CertSubject  = extract(@"Subject:\s+(.+?)[\r\n]", 1, EventData),
+    Template     = extract(@"Certificate Template:\s+(.+?)[\r\n]", 1, EventData),
+    RequestID    = extract(@"Request ID:\s+(\d+)", 1, EventData)
+| where CertSubject has_any (PrivilegedAccounts)              // cert claims privileged identity
+| extend
+    RequesterClean = tolower(extract(@"\\(.+)$", 1, Requester)),
+    SubjectClean   = tolower(CertSubject)
+| where not(RequesterClean has_any (PrivilegedAccounts))      // but requester is NOT privileged
+| extend AttackSignal = strcat(
+    "ESC1 likely: ", Requester,
+    " obtained certificate claiming identity: ", CertSubject,
+    " via template: ", Template,
+    " (Request ID: ", RequestID, ")")
+| project
+    TimeGenerated,
+    Computer,
+    Requester,
+    CertSubject,
+    Template,
+    RequestID,
+    AttackSignal
+| sort by TimeGenerated desc
+
+// ============================================================
+
+// -- Secondary detection: Strong mapping failure on DC --
+// System Event 39/41: Certificate auth rejected by DC
+// Fires when ESC1 auth is attempted on patched WS2025
+
+Event
+| where EventID in (39, 41)
+| where Source == "Microsoft-Windows-Kerberos-Key-Distribution-Center"
+| extend
+    EventDescription = iff(EventID == 39,
+        "Certificate auth failed — missing or mismatched SID (possible ESC1 attempt)",
+        "Certificate mapping rejected in Full Enforcement Mode (possible ESC1 attempt)")
+| extend AttackSignal = strcat(
+    "KDC rejected certificate-based auth (Event ", EventID, "): ",
+    EventDescription, " on ", Computer)
+| project
+    TimeGenerated,
+    Computer,
+    EventID,
+    EventDescription,
+    AttackSignal
+| sort by TimeGenerated desc
